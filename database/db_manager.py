@@ -13,9 +13,30 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from google.cloud.firestore import Increment
+from google.cloud.firestore import Increment, async_transactional
 from google.cloud.firestore_v1 import AsyncDocumentReference
 from google.cloud.firestore_v1.base_query import FieldFilter
+
+
+class InsufficientSparksError(Exception):
+    """Raised when a user doesn't have enough Sparks for an operation."""
+    pass
+
+
+class UserNotFoundError(Exception):
+    """Raised when a user document is not found in Firestore."""
+    pass
+
+
+class CooldownActiveError(Exception):
+    """Raised when a user attempts to open a mystery box during cooldown."""
+    pass
+
+
+class MaxShieldsReachedError(Exception):
+    """Raised when a user already has the maximum allowed streak shields."""
+    pass
+
 
 import config
 from database.firebase_init import get_db
@@ -263,6 +284,235 @@ async def create_order(
     _, _ref = await db.collection(ORDERS_COL).add(order_data)
     logger.info("Order created: %s for user %s", _ref.id, user_id)
     return _ref.id
+
+
+async def place_order_transactional(
+    user_id: int | str,
+    package_type: str,
+    sparks_spent: int,
+    views_ordered: int,
+    instagram_url: str,
+) -> str:
+    """
+    Atomically verify user has enough balance, deduct Sparks, log the
+    transaction, and place the order using a Firestore transaction.
+    This prevents double-spending / race conditions.
+
+    Returns the generated order ID.
+    Raises UserNotFoundError if user document does not exist.
+    Raises InsufficientSparksError if the user's spark balance is too low.
+    """
+    db = get_db()
+    transaction = db.transaction()
+
+    @async_transactional
+    async def _run_in_tx(tx) -> str:
+        user_ref = db.collection(USERS_COL).document(str(user_id))
+        user_snap = await tx.get(user_ref)
+
+        if not user_snap.exists:
+            raise UserNotFoundError(f"User {user_id} not found in database.")
+
+        user_data = user_snap.to_dict() or {}
+        current_balance = user_data.get("spark_balance", 0)
+
+        if current_balance < sparks_spent:
+            raise InsufficientSparksError(
+                f"Insufficient Sparks: user has {current_balance}, need {sparks_spent}."
+            )
+
+        new_balance = current_balance - sparks_spent
+        new_total_orders = user_data.get("total_orders", 0) + 1
+
+        # Pre-generate IDs for order and transaction logs
+        order_ref = db.collection(ORDERS_COL).document()
+        tx_ref = db.collection(TRANSACTIONS_COL).document()
+
+        now = get_ist_now()
+
+        order_data: dict[str, Any] = {
+            "user_id": str(user_id),
+            "package_type": package_type,
+            "sparks_spent": sparks_spent,
+            "views_ordered": views_ordered,
+            "instagram_url": instagram_url,
+            "status": "pending",
+            "created_at": now,
+            "delivered_at": None,
+            "compensation_given": False,
+        }
+
+        tx_data: dict[str, Any] = {
+            "user_id": str(user_id),
+            "type": "spend",
+            "amount": sparks_spent,
+            "source": f"order_{package_type}",
+            "created_at": now,
+        }
+
+        # Queue updates/writes in transaction
+        tx.update(user_ref, {
+            "spark_balance": new_balance,
+            "total_orders": new_total_orders
+        })
+        tx.set(order_ref, order_data)
+        tx.set(tx_ref, tx_data)
+
+        logger.info(
+            "Transaction successful for user %s: deducted %s Sparks, order %s created.",
+            user_id, sparks_spent, order_ref.id
+        )
+        return order_ref.id
+
+    return await _run_in_tx(transaction)
+
+
+async def open_mystery_box_transactional(
+    user_id: int | str,
+    cost_sparks: int,
+    won_sparks: int,
+) -> tuple[int, int]:
+    """
+    Atomically verify cooldown is clear, verify user has enough Sparks to open,
+    deduct the cost, add the won Sparks, update cooldown date, and log transactions.
+
+    Returns a tuple of (cost_sparks, won_sparks).
+    Raises UserNotFoundError, InsufficientSparksError, or CooldownActiveError.
+    """
+    db = get_db()
+    transaction = db.transaction()
+    today_str = get_ist_now().strftime("%Y-%m-%d")
+
+    @async_transactional
+    async def _run_in_tx(tx) -> tuple[int, int]:
+        user_ref = db.collection(USERS_COL).document(str(user_id))
+        user_snap = await tx.get(user_ref)
+
+        if not user_snap.exists:
+            raise UserNotFoundError(f"User {user_id} not found in database.")
+
+        user_data = user_snap.to_dict() or {}
+
+        # 1. Cooldown check inside transaction
+        last_box_date = user_data.get("last_mystery_box_date")
+        if last_box_date == today_str:
+            raise CooldownActiveError("Mystery Box already opened today.")
+
+        # 2. Balance check
+        current_balance = user_data.get("spark_balance", 0)
+        if current_balance < cost_sparks:
+            raise InsufficientSparksError(
+                f"Insufficient Sparks: user has {current_balance}, need {cost_sparks} to open."
+            )
+
+        # 3. Compute balances
+        new_balance = current_balance - cost_sparks + won_sparks
+        new_lifetime = user_data.get("lifetime_sparks", 0) + won_sparks
+
+        # 4. Queue updates
+        tx.update(user_ref, {
+            "spark_balance": new_balance,
+            "lifetime_sparks": new_lifetime,
+            "last_mystery_box_date": today_str
+        })
+
+        # 5. Log double ledger entries for auditability
+        now = get_ist_now()
+
+        # Spend Log
+        tx_spend_ref = db.collection(TRANSACTIONS_COL).document()
+        tx.set(tx_spend_ref, {
+            "user_id": str(user_id),
+            "type": "spend",
+            "amount": cost_sparks,
+            "source": "mystery_box_open",
+            "created_at": now,
+        })
+
+        # Win Log
+        tx_win_ref = db.collection(TRANSACTIONS_COL).document()
+        tx.set(tx_win_ref, {
+            "user_id": str(user_id),
+            "type": "bonus",
+            "amount": won_sparks,
+            "source": "mystery_box_reward",
+            "created_at": now,
+        })
+
+        logger.info(
+            "Mystery box opened successfully for user %s: spent %s, won %s.",
+            user_id, cost_sparks, won_sparks
+        )
+        return cost_sparks, won_sparks
+
+    return await _run_in_tx(transaction)
+
+
+async def buy_streak_shield_transactional(
+    user_id: int | str,
+    cost_sparks: int = 200,
+    max_shields: int = 3,
+) -> tuple[int, int]:
+    """
+    Atomically buy a streak shield.
+    Verifies user exists, checks balance, checks if shields are below max_shields,
+    deducts cost, increments streak_shields, and logs transaction.
+
+    Returns a tuple of (new_shields, new_balance).
+    Raises UserNotFoundError, InsufficientSparksError, or MaxShieldsReachedError.
+    """
+    db = get_db()
+    transaction = db.transaction()
+
+    @async_transactional
+    async def _run_in_tx(tx) -> tuple[int, int]:
+        user_ref = db.collection(USERS_COL).document(str(user_id))
+        user_snap = await tx.get(user_ref)
+
+        if not user_snap.exists:
+            raise UserNotFoundError(f"User {user_id} not found in database.")
+
+        user_data = user_snap.to_dict() or {}
+
+        # 1. Shields check
+        current_shields = int(user_data.get("streak_shields", 0))
+        if current_shields >= max_shields:
+            raise MaxShieldsReachedError(f"Already have max shields ({max_shields}).")
+
+        # 2. Balance check
+        current_balance = int(user_data.get("spark_balance", 0))
+        if current_balance < cost_sparks:
+            raise InsufficientSparksError(
+                f"Insufficient Sparks: user has {current_balance}, need {cost_sparks} to buy shield."
+            )
+
+        # 3. Compute new values
+        new_shields = current_shields + 1
+        new_balance = current_balance - cost_sparks
+
+        # 4. Queue updates
+        tx.update(user_ref, {
+            "streak_shields": new_shields,
+            "spark_balance": new_balance,
+        })
+
+        # 5. Log transaction
+        tx_ref = db.collection(TRANSACTIONS_COL).document()
+        tx.set(tx_ref, {
+            "user_id": str(user_id),
+            "type": "spend",
+            "amount": cost_sparks,
+            "source": "buy_streak_shield",
+            "created_at": get_ist_now(),
+        })
+
+        logger.info(
+            "Streak shield bought successfully for user %s: spent %s, new shields: %s.",
+            user_id, cost_sparks, new_shields
+        )
+        return new_shields, new_balance
+
+    return await _run_in_tx(transaction)
 
 
 async def get_order(order_id: str) -> dict[str, Any] | None:
