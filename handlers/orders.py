@@ -18,8 +18,12 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 from config import PACKAGES
-from google.cloud.firestore import Increment
-from database.db_manager import deduct_spark_balance, get_user, log_transaction, create_order, update_user
+from database.db_manager import (
+    get_user,
+    place_order_transactional,
+    InsufficientSparksError,
+    UserNotFoundError,
+)
 from keyboards.inline import (
     confirm_order_keyboard,
     order_keyboard_empty,
@@ -158,36 +162,33 @@ async def cb_confirm_order(query: CallbackQuery) -> None:
 
     user_id = query.from_user.id
     user_data = await get_user(user_id)
-    sparks = user_data.get("spark_balance", 0) if user_data else 0
+    ig = (user_data or {}).get("instagram_handle", "")
 
-    if sparks < pkg["sparks"]:
+    try:
+        order_id = await place_order_transactional(
+            user_id=user_id,
+            package_type=package_type,
+            sparks_spent=pkg["sparks"],
+            views_ordered=pkg["views"],
+            instagram_url=ig or "",
+        )
+    except InsufficientSparksError:
         await query.message.edit_text(
             "❌ <b>Insufficient Sparks.</b>\n\nYour balance may have changed. Please try again.",
             reply_markup=order_keyboard_empty(),
         )
         return
-
-    ig = (user_data or {}).get("instagram_handle", "")
-
-    await deduct_spark_balance(user_id, pkg["sparks"])
-    await log_transaction(
-        user_id=user_id,
-        tx_type="spend",
-        amount=pkg["sparks"],
-        source=f"order_{package_type}",
-    )
-    order_id = await create_order(
-        user_id=user_id,
-        package_type=package_type,
-        sparks_spent=pkg["sparks"],
-        views_ordered=pkg["views"],
-        instagram_url=ig or "",
-    )
-    await update_user(user_id, {"total_orders": Increment(1)})
-    logger.info(
-        "Order %s created: user %s, package %s, %s Sparks deducted.",
-        order_id, user_id, package_type, pkg["sparks"],
-    )
+    except UserNotFoundError:
+        await query.message.edit_text(
+            "⚠️ Please use /start first to set up your Vault."
+        )
+        return
+    except Exception as e:
+        logger.error("Failed to place order for user %s: %s", user_id, e, exc_info=True)
+        await query.message.edit_text(
+            "⚠️ An error occurred while processing your order. Please try again later."
+        )
+        return
 
     display_name = _PKG_DISPLAY.get(package_type, package_type.title())
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
