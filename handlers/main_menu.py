@@ -41,6 +41,11 @@ from database.db_manager import (
     increment_spark_balance,
     log_transaction,
     update_user,
+    open_mystery_box_transactional,
+    CooldownActiveError,
+    InsufficientSparksError,
+    buy_streak_shield_transactional,
+    MaxShieldsReachedError,
 )
 from keyboards.inline import (
     dashboard_keyboard,
@@ -147,8 +152,17 @@ async def _run_lazy_streak(
         # Already visited today — nothing to do, query still needs answering
         return user_data, popup_shown
 
-    # Determine new streak
-    new_streak = streak + 1 if diff == 1 else 1
+    # Determine new streak and shield usage
+    shield_used = False
+    shields = int(user_data.get("streak_shields", 0))
+
+    if diff == 1:
+        new_streak = streak + 1
+    elif diff == 2 and shields > 0:
+        new_streak = streak + 1
+        shield_used = True
+    else:
+        new_streak = 1
 
     milestone_bonus = STREAK_MILESTONES.get(new_streak, 0)
 
@@ -156,6 +170,16 @@ async def _run_lazy_streak(
         "streak_days": new_streak,
         "last_login": now_ist,
     }
+    if shield_used:
+        update_fields["streak_shields"] = shields - 1
+
+    popup_messages = []
+    if shield_used:
+        popup_messages.append(
+            f"🛡️ Streak Shield Used!\n"
+            f"Kal login miss hua, par Streak Shield ne aapka streak bacha liya. "
+            f"Aaj Day {new_streak} hai!"
+        )
 
     if milestone_bonus:
         await increment_spark_balance(user_id, milestone_bonus)
@@ -169,19 +193,22 @@ async def _run_lazy_streak(
             "Streak milestone! User %s hit Day %s — bonus %s Sparks",
             user_id, new_streak, milestone_bonus,
         )
-        # Answer query with popup BEFORE returning — caller must not answer again
-        if query is not None:
-            await query.answer(
-                f"🔥 Streak Bonus! Day {new_streak} — +{milestone_bonus} Sparks! 🎉",
-                show_alert=True,
-            )
-            popup_shown = True
+        popup_messages.append(
+            f"🔥 Streak Bonus! Day {new_streak} — +{milestone_bonus} Sparks! 🎉"
+        )
+
+    # Answer query with popup BEFORE returning — caller must not answer again
+    if popup_messages and query is not None:
+        await query.answer("\n\n".join(popup_messages), show_alert=True)
+        popup_shown = True
 
     await update_user(user_id, update_fields)
 
     # Mutate local dict so caller sees fresh values without a second Firestore read
     user_data["streak_days"] = new_streak
     user_data["last_login"] = now_ist
+    if shield_used:
+        user_data["streak_shields"] = shields - 1
     if milestone_bonus:
         user_data["spark_balance"] = (
             int(user_data.get("spark_balance", 0)) + milestone_bonus
@@ -388,20 +415,23 @@ async def _render_rewards_screen(
 ) -> None:
     user_data = await get_user(user_id)
     streak = user_data.get("streak_days", 0) if user_data else 0
+    shields = user_data.get("streak_shields", 0) if user_data else 0
 
     text = (
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🎁 <b>REWARDS CENTER</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🔥 <b>Current Streak:</b> {streak} Days\n\n"
-        "🎰 <b>Mystery Box:</b> Daily Free Sparks!\n"
+        f"🔥 <b>Current Streak:</b> {streak} Days\n"
+        f"🛡️ <b>Streak Shields:</b> {shields} / 3\n\n"
+        "🎰 <b>Mystery Box:</b> Open for 100 Sparks to win up to 2,000 Sparks!\n"
+        "🛡️ <b>Streak Shield:</b> Buy for 200 Sparks to protect your streak from resetting if you miss a day!\n"
         "━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
     if edit:
-        await message.edit_text(text, reply_markup=rewards_keyboard())
+        await message.edit_text(text, reply_markup=rewards_keyboard(shields=shields))
     else:
-        await message.answer(text, reply_markup=rewards_keyboard())
+        await message.answer(text, reply_markup=rewards_keyboard(shields=shields))
 
 
 # ===========================================================================
@@ -529,21 +559,21 @@ async def cb_mystery_box(query: CallbackQuery) -> None:
     won_sparks = random.randint(mins[chosen_idx], maxs[chosen_idx])
 
     # ── Atomic DB writes ──────────────────────────────────────────────────
-    await increment_spark_balance(user_id, won_sparks)
-    await update_user(user_id, {"last_mystery_box_date": today_str})
-    await log_transaction(
-        user_id=user_id,
-        tx_type="bonus",
-        amount=won_sparks,
-        source="mystery_box",
-    )
-    logger.info("Mystery Box: user %s won %s Sparks", user_id, won_sparks)
+    try:
+        await open_mystery_box_transactional(user_id, cost_sparks=100, won_sparks=won_sparks)
+    except CooldownActiveError:
+        await query.answer("😅 Aaj ka box khul chuka hai! Kal wapas aana. 🌙", show_alert=True)
+        return
+    except InsufficientSparksError:
+        await query.answer("⚠️ Mystery Box kholne ke liye 100 Sparks chahiye!", show_alert=True)
+        return
 
     # ── Answer once, then edit message ───────────────────────────────────
     await query.answer()
     text = (
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🎁 <b>Box Khul Gaya!</b>\n\n"
+        "⚡ <b>100 Sparks spent!</b>\n"
         f"🎉 Tujhe mila: <b>{won_sparks} Sparks!</b> ⚡\n\n"
         "Kal bhi try karna — kal ka box aaj se bada ho sakta hai! 😄\n"
         "━━━━━━━━━━━━━━━━━━━━━━━"
@@ -735,7 +765,6 @@ _COMING_SOON = {
     "faq",
     "mission_start",
     "mystery_box_open",
-    "use_shield",
     "jackpot_tickets",
     "notif_settings",
     "tx_history",
@@ -745,6 +774,73 @@ _COMING_SOON = {
 @router.callback_query(F.data.in_(_COMING_SOON))
 async def cb_coming_soon(query: CallbackQuery) -> None:
     await query.answer("🚧 Coming soon! Yeh feature Phase 5 mein aayega.", show_alert=True)
+
+
+@router.callback_query(F.data == "action_buy_shield")
+async def cb_buy_shield(query: CallbackQuery) -> None:
+    """Buy a Streak Shield handler."""
+    if query.message is None:
+        await query.answer()
+        return
+
+    user_id = query.from_user.id
+    try:
+        new_shields, new_balance = await buy_streak_shield_transactional(
+            user_id=user_id,
+            cost_sparks=200,
+            max_shields=3,
+        )
+        await query.answer(
+            f"🛡️ Streak Shield Purchased!\n\n"
+            f"Aapne successfully 1 Streak Shield buy kiya hai.\n"
+            f"Deducted: -200 Sparks\n"
+            f"New Balance: {new_balance:,} Sparks",
+            show_alert=True
+        )
+        # Re-render the rewards screen with updated shields
+        await _render_rewards_screen(user_id, query.message, edit=True)
+    except InsufficientSparksError:
+        await query.answer(
+            "❌ Insufficient Sparks!\n\n"
+            "Streak Shield buy karne ke liye 200 Sparks chahiye. "
+            "Daily Missions complete karke Sparks kamaein!",
+            show_alert=True
+        )
+    except MaxShieldsReachedError:
+        await query.answer(
+            "❌ Max Shields Reached!\n\n"
+            "Aap maximum 3 Streak Shields hi rakh sakte hain.",
+            show_alert=True
+        )
+    except Exception as e:
+        logger.error("Error purchasing streak shield: %s", e)
+        await query.answer(
+            "⚠️ Error while buying Streak Shield. Please try again later.",
+            show_alert=True
+        )
+
+
+@router.callback_query(F.data == "action_shields_full")
+async def cb_shields_full(query: CallbackQuery) -> None:
+    """Show alert when user already has maximum shields."""
+    await query.answer(
+        "🛡️ Streak Shields Limit Full!\n\n"
+        "Aapke paas already maximum (3/3) Streak Shields hain. "
+        "Inhe use hone ke baad hi aap aur buy kar payenge.",
+        show_alert=True
+    )
+
+
+@router.callback_query(F.data == "use_shield")
+async def cb_use_shield(query: CallbackQuery) -> None:
+    """Explain that shields are used automatically."""
+    await query.answer(
+        "🛡️ Automatic Streak Protection!\n\n"
+        "Streak Shields ko manually activate karne ki zaroorat nahi hai. "
+        "Agar aap kisi din login nahi kar paate, toh system automatically "
+        "1 shield consume karke aapka streak reset hone se bacha lega!",
+        show_alert=True
+    )
 
 
 # ===========================================================================
