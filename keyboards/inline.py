@@ -219,24 +219,41 @@ def order_keyboard_empty() -> InlineKeyboardMarkup:
     )
 
 
-def rewards_keyboard() -> InlineKeyboardMarkup:
+def rewards_keyboard(shields: int = 0) -> InlineKeyboardMarkup:
     """Rewards center."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎰 Mystery Box Kholao (Daily Free)",
-                    callback_data="action_mystery_box",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Dashboard",
-                    callback_data="go_dashboard",
-                )
-            ],
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="🎰 Mystery Box (100 Sparks)",
+                callback_data="action_mystery_box",
+            )
         ]
-    )
+    ]
+
+    if shields < 3:
+        buttons.append([
+            InlineKeyboardButton(
+                text="🛡️ Buy Streak Shield (200 Sparks)",
+                callback_data="action_buy_shield",
+            )
+        ])
+    else:
+        buttons.append([
+            InlineKeyboardButton(
+                text="🛡️ Streak Shields Full (Max 3)",
+                callback_data="action_shields_full",
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="⬅️ Dashboard",
+            callback_data="go_dashboard",
+        )
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 
 
 def profile_keyboard(ig_linked: bool = False) -> InlineKeyboardMarkup:
